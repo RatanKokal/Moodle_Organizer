@@ -6,6 +6,7 @@ import argparse
 import re
 import requests
 from bs4 import BeautifulSoup
+import hashlib
 from urllib.parse import unquote, urlparse
 
 # --- CONFIGURATION ---
@@ -27,6 +28,13 @@ def sanitize_filename(name):
     cleaned = re.sub(r'[<>:"/\\|?*]', '', name)
     return cleaned.strip()[:100]
 
+def compute_stable_hash(*args):
+    """Compute a stable SHA-256 hash from multiple string components."""
+    hasher = hashlib.sha256()
+    for arg in args:
+        # Encode string to bytes, handle None safely
+        hasher.update(str(arg).encode('utf-8'))
+    return hasher.hexdigest()
 
 def load_cookies():
     """Load cookies from the configured file (Netscape or Key=Value format)."""
@@ -249,34 +257,101 @@ class MoodleClient:
             print(f"    [!] Error downloading resource {name}: {e}")
 
     def process_assignment(self, course_id, url, name, save_dir):
-        """Process assignments: fetch description and attachments."""
+        """Process assignments with strict fingerprinting and status detection."""
         a_id = re.search(r'id=(\d+)', url).group(1)
         manifest_key = f"{course_id}_assign_{a_id}"
         save_path = os.path.join(save_dir, name)
 
         try:
             soup, _ = self.get_soup(url)
+            
+            # 1. SCRAPE INSTRUCTIONS (Description)
             desc_div = soup.find('div', class_='no-overflow') or soup.find('div', id='intro')
             desc_text = desc_div.get_text(separator="\n", strip=True) if desc_div else "No description."
 
+            # 2. SCRAPE ATTACHMENTS (Teacher Files)
             attachments = []
-            for l in soup.find_all('a', href=True):
-                if 'pluginfile.php' in l['href'] and 'assign/intro' in l['href']:
-                    attachments.append((l.get_text(strip=True), l['href']))
+            intro_section = soup.find('div', id='intro')
+            if intro_section:
+                for l in intro_section.find_all('a', href=True):
+                    if 'pluginfile.php' in l['href']:
+                        attachments.append((l.get_text(strip=True), l['href']))
+            
+            # 3. SCRAPE METADATA (Submission Status, Grading Status, Due Date, Grade)
+            # We iterate through ALL 'generaltable' instances (Submission status AND Feedback)
+            meta_info = {}
+            tables = soup.find_all('table', class_='generaltable')
+            
+            for table in tables:
+                rows = table.find_all('tr')
+                for row in rows:
+                    header = row.find(['th'])
+                    data = row.find(['td'])
+                    if header and data:
+                        key = header.get_text(strip=True).replace(':', '')
+                        
+                        # --- CLEANUP: Remove "Garbage" from Comment Cell ---
+                        # 1. Remove the hidden template (causes ___picture___)
+                        template = data.find('div', id='cmt-tmpl')
+                        if template:
+                            template.decompose()
+                        
+                        # 2. Remove the "Show comments" / "Add comment" UI buttons
+                        for garbage in data.find_all('div', class_=['comment-ctrl', 'mdl-left']):
+                            garbage.decompose()
+                        
+                        # 3. Get text after cleanup
+                        val = data.get_text(separator=" ", strip=True)
+                        
+                        # 4. If empty after cleanup, make it explicit
+                        if not val and "comments" in key.lower():
+                            val = "0 comments"
 
-            # Hash check for updates
+                        if key and val:
+                            meta_info[key] = val
+
+            # 4. COMPUTE STABLE FINGERPRINT (SHA-256)
+            # Fingerprint = Instructions + File List + All Metadata (Grades/Dates)
+            sorted_files = sorted(attachments)
+            sorted_meta = json.dumps(meta_info, sort_keys=True)
+            
+            current_hash = compute_stable_hash(desc_text, str(sorted_files), sorted_meta)
+
+            # 5. STATUS CHECK
             prev_data = self.manifest.get("courses", {}).get(manifest_key, {})
-            current_hash = hash(desc_text + str(len(attachments)))
-
-            if prev_data.get('hash') == current_hash and os.path.exists(save_path):
+            is_tracked = manifest_key in self.manifest.get("courses", {})
+            local_exists = os.path.exists(save_path)
+            
+            # If nothing changed and folder exists, skip
+            if is_tracked and prev_data.get('hash') == current_hash and local_exists:
                 return
 
-            if not os.path.exists(save_path):
+            # Determine the status label
+            if not is_tracked:
+                status_label = "[NEW]"
+            elif prev_data.get('hash') != current_hash:
+                status_label = "[UPDATE]"
+            else:
+                status_label = "[RESTORE]" # Hash matched, but folder was missing
+
+            # 6. DOWNLOAD & SAVE
+            if not local_exists:
                 os.makedirs(save_path)
 
-            # Write Description
+            # Write Assignment Details Markdown
             with open(os.path.join(save_path, "Assignment_Details.md"), "w", encoding='utf-8') as f:
-                f.write(f"# {name}\n\n{desc_text}\n")
+                f.write(f"# {name}\n\n")
+                
+                # Write Metadata/Status (Grades/Deadlines) at the top
+                if meta_info:
+                    f.write("## Status & Feedback\n")
+                    f.write("| Item | Value |\n|---|---|\n")
+                    for k, v in meta_info.items():
+                        f.write(f"| **{k}** | {v} |\n")
+                    f.write("\n---\n\n")
+                
+                f.write("## Instructions\n\n")
+                f.write(desc_text)
 
             # Download Attachments
             for fname, flink in attachments:
@@ -284,8 +359,9 @@ class MoodleClient:
                 with open(os.path.join(save_path, sanitize_filename(fname)), 'wb') as f:
                     f.write(f_resp.content)
 
-            print(f"    [UPDATE] Assignment: {name}")
+            print(f"    {status_label} Assignment: {name}")
 
+            # Update Manifest
             if "courses" not in self.manifest:
                 self.manifest["courses"] = {}
             self.manifest["courses"][manifest_key] = {"hash": current_hash}
